@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+Neural Network Training with Incremental Learning and Memory Optimization
+Incorporates all important features + add_trans + add_event data
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, classification_report
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.utils import to_categorical
+import warnings
+import time
+import psutil
+import joblib
+import gc
+from pathlib import Path
+from collections import Counter
+import logging
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class NeuralNetworkTrainer:
+    """Memory-efficient neural network trainer with incremental learning"""
+    
+    def __init__(self, batch_size=5000):
+        self.batch_size = batch_size
+        self.model = None
+        self.scaler = None
+        self.imputer = None
+        self.feature_names = None
+        
+    def load_important_features(self):
+        """Load the most important features"""
+        try:
+            with open('top_100_features.txt', 'r') as f:
+                important_features = [line.strip() for line in f.readlines()]
+            print(f"✅ Loaded {len(important_features)} important features")
+        except FileNotFoundError:
+            important_features = [
+                'f366', 'f223', 'f132', 'f363', 'f210', 'f365', 'f364', 'f362', 
+                'f361', 'f360', 'f359', 'f358', 'f357', 'f356', 'f355', 'f354'
+            ]
+            print(f"⚠️ Using fallback {len(important_features)} features")
+        return important_features
+    
+    def load_and_preprocess_batch(self, batch_start, batch_size, important_features, 
+                                 preprocessor=None, fit_preprocessor=False):
+        """Load and preprocess a batch of data with feature engineering"""
+        try:
+            # Load main training data batch
+            train_df = pd.read_parquet('train_data.parquet')
+            batch_end = min(batch_start + batch_size, len(train_df))
+            batch_df = train_df.iloc[batch_start:batch_end].copy()
+            
+            # Clean up full dataset
+            del train_df
+            gc.collect()
+            
+            # Extract main features
+            available_features = [f for f in important_features if f in batch_df.columns]
+            X_batch = batch_df[available_features].copy()
+            y_batch = pd.to_numeric(batch_df['y'], errors='coerce')
+            
+            # Get id2 values for joining
+            id2_values = batch_df['id2'].unique()
+            
+            # Add transaction features
+            if len(id2_values) > 0:
+                X_batch = self.add_trans_features(X_batch, id2_values)
+                X_batch = self.add_event_features(X_batch, id2_values)
+            
+            # Convert to numeric and clean
+            for col in X_batch.columns:
+                if X_batch[col].dtype == 'object':
+                    X_batch[col] = pd.to_numeric(X_batch[col], errors='coerce')
+            
+            # Handle missing values
+            if fit_preprocessor:
+                self.imputer = SimpleImputer(strategy='median')
+                X_processed = pd.DataFrame(
+                    self.imputer.fit_transform(X_batch),
+                    columns=X_batch.columns,
+                    index=X_batch.index
+                )
+                self.feature_names = X_batch.columns.tolist()
+            else:
+                # Align features
+                aligned_batch = pd.DataFrame(index=X_batch.index)
+                for feature in self.feature_names:
+                    if feature in X_batch.columns:
+                        aligned_batch[feature] = X_batch[feature]
+                    else:
+                        aligned_batch[feature] = 0.0
+                
+                X_processed = pd.DataFrame(
+                    self.imputer.transform(aligned_batch),
+                    columns=self.feature_names,
+                    index=aligned_batch.index
+                )
+            
+            # Remove NaN values
+            valid_mask = ~(X_processed.isnull().any(axis=1) | y_batch.isnull())
+            X_processed = X_processed[valid_mask]
+            y_batch = y_batch[valid_mask]
+            
+            # Clean up
+            del batch_df, X_batch
+            gc.collect()
+            
+            return X_processed, y_batch
+            
+        except Exception as e:
+            print(f"❌ Error processing batch: {e}")
+            return None, None
+    
+    def add_trans_features(self, X_batch, id2_values):
+        """Add transaction-based features"""
+        try:
+            # Load add_trans data for these id2 values
+            add_trans_df = pd.read_parquet('add_trans.parquet')
+            add_trans_filtered = add_trans_df[add_trans_df['id2'].isin(id2_values)]
+            
+            if len(add_trans_filtered) > 0:
+                # Create aggregations
+                trans_agg = add_trans_filtered.groupby('id2').agg({
+                    'f367': ['count', 'mean', 'std', 'sum']  # Assuming f367 is amount
+                }).fillna(0)
+                
+                # Flatten column names
+                trans_agg.columns = [f"trans_{col[1]}_{col[0]}" for col in trans_agg.columns]
+                
+                # Merge with batch
+                X_batch = X_batch.merge(trans_agg, left_on='id2', right_index=True, how='left')
+                
+                # Fill NaN with 0
+                for col in trans_agg.columns:
+                    if col in X_batch.columns:
+                        X_batch[col] = X_batch[col].fillna(0)
+            
+            # Clean up
+            del add_trans_df, add_trans_filtered, trans_agg
+            gc.collect()
+            
+            return X_batch
+            
+        except Exception as e:
+            print(f"⚠️ Error adding trans features: {e}")
+            return X_batch
+    
+    def add_event_features(self, X_batch, id2_values):
+        """Add event-based features"""
+        try:
+            # Load add_event data for these id2 values
+            add_event_df = pd.read_parquet('add_event.parquet')
+            add_event_filtered = add_event_df[add_event_df['id2'].isin(id2_values)]
+            
+            if len(add_event_filtered) > 0:
+                # Create aggregations
+                event_agg = add_event_filtered.groupby('id2').agg({
+                    'id3': 'count',  # Event count
+                    'id6': 'nunique'  # Unique event types
+                }).fillna(0)
+                
+                event_agg.columns = ['event_count_per_id2', 'unique_events_per_id2']
+                
+                # Merge with batch
+                X_batch = X_batch.merge(event_agg, left_on='id2', right_index=True, how='left')
+                
+                # Fill NaN with 0
+                for col in event_agg.columns:
+                    if col in X_batch.columns:
+                        X_batch[col] = X_batch[col].fillna(0)
+            
+            # Clean up
+            del add_event_df, add_event_filtered, event_agg
+            gc.collect()
+            
+            return X_batch
+            
+        except Exception as e:
+            print(f"⚠️ Error adding event features: {e}")
+            return X_batch
+    
+    def create_neural_network(self, input_dim):
+        """Create neural network architecture"""
+        model = Sequential([
+            Dense(256, activation='relu', input_dim=input_dim),
+            BatchNormalization(),
+            Dropout(0.3),
+            
+            Dense(128, activation='relu'),
+            BatchNormalization(),
+            Dropout(0.3),
+            
+            Dense(64, activation='relu'),
+            BatchNormalization(),
+            Dropout(0.2),
+            
+            Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy', 'AUC']
+        )
+        
+        return model
+    
+    def train_incremental(self, important_features, total_samples=770164):
+        """Train neural network using incremental learning"""
+        print(f"🚀 INCREMENTAL NEURAL NETWORK TRAINING")
+        print("=" * 60)
+        
+        n_batches = (total_samples + self.batch_size - 1) // self.batch_size
+        print(f"📊 Training Configuration:")
+        print(f"   Total samples: {total_samples:,}")
+        print(f"   Batch size: {self.batch_size:,}")
+        print(f"   Number of batches: {n_batches}")
+        print(f"   Features: {len(important_features)}")
+        
+        total_samples_processed = 0
+        batch_aucs = []
+        
+        for batch_idx in range(n_batches):
+            batch_start = batch_idx * self.batch_size
+            print(f"\n📦 Processing batch {batch_idx + 1}/{n_batches}")
+            
+            # Load and preprocess batch
+            X_batch, y_batch = self.load_and_preprocess_batch(
+                batch_start, self.batch_size, important_features,
+                preprocessor=self.imputer, fit_preprocessor=(batch_idx == 0)
+            )
+            
+            if X_batch is None or len(X_batch) == 0:
+                print(f"   ⚠️ Skipping empty batch {batch_idx + 1}")
+                continue
+            
+            # Scale features
+            if batch_idx == 0:
+                self.scaler = StandardScaler()
+                X_scaled = self.scaler.fit_transform(X_batch)
+            else:
+                X_scaled = self.scaler.transform(X_batch)
+            
+            # Create or update model
+            if self.model is None:
+                self.model = self.create_neural_network(X_scaled.shape[1])
+            
+            # Split batch for validation
+            split_idx = int(len(X_scaled) * 0.8)
+            X_train_batch = X_scaled[:split_idx]
+            y_train_batch = y_batch[:split_idx]
+            X_val_batch = X_scaled[split_idx:]
+            y_val_batch = y_batch[split_idx:]
+            
+            # Train model
+            callbacks = [
+                EarlyStopping(patience=5, restore_best_weights=True),
+                ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-6)
+            ]
+            
+            history = self.model.fit(
+                X_train_batch, y_train_batch,
+                validation_data=(X_val_batch, y_val_batch),
+                epochs=10,
+                batch_size=32,
+                callbacks=callbacks,
+                verbose=1
+            )
+            
+            # Evaluate batch
+            batch_pred = self.model.predict(X_scaled)
+            batch_auc = roc_auc_score(y_batch, batch_pred)
+            batch_aucs.append(batch_auc)
+            
+            print(f"   📈 Batch AUC: {batch_auc:.4f}")
+            
+            total_samples_processed += len(X_batch)
+            
+            # Memory cleanup
+            del X_batch, y_batch, X_scaled, X_train_batch, y_train_batch, X_val_batch, y_val_batch
+            gc.collect()
+            
+            # Progress update
+            if (batch_idx + 1) % 5 == 0:
+                avg_auc = np.mean(batch_aucs[-5:])
+                print(f"   📊 Progress: {total_samples_processed:,}/{total_samples:,} ({100*total_samples_processed/total_samples:.1f}%)")
+                print(f"   📊 Recent avg AUC: {avg_auc:.4f}")
+        
+        print(f"\n✅ Incremental training complete!")
+        print(f"   Total samples processed: {total_samples_processed:,}")
+        print(f"   Average batch AUC: {np.mean(batch_aucs):.4f}")
+        
+        return self.model
+    
+    def save_model(self):
+        """Save the trained model and preprocessors"""
+        model_filename = 'best_model_neural_network_incremental.h5'
+        scaler_filename = 'scaler_neural_network.pkl'
+        imputer_filename = 'imputer_neural_network.pkl'
+        feature_filename = 'features_neural_network.txt'
+        
+        # Save model
+        self.model.save(model_filename)
+        
+        # Save preprocessors
+        joblib.dump(self.scaler, scaler_filename)
+        joblib.dump(self.imputer, imputer_filename)
+        
+        # Save feature names
+        with open(feature_filename, 'w') as f:
+            for feature in self.feature_names:
+                f.write(f"{feature}\n")
+        
+        print(f"✅ Model saved: {model_filename}")
+        print(f"✅ Preprocessors saved: {scaler_filename}, {imputer_filename}")
+        
+        return model_filename, scaler_filename, imputer_filename, feature_filename
+
+def main():
+    """Main training function"""
+    print("🚀 NEURAL NETWORK TRAINING WITH INCREMENTAL LEARNING")
+    print("=" * 80)
+    
+    start_time = time.time()
+    
+    try:
+        # Initialize trainer
+        trainer = NeuralNetworkTrainer(batch_size=5000)
+        
+        # Load important features
+        important_features = trainer.load_important_features()
+        
+        # Train neural network
+        model = trainer.train_incremental(important_features)
+        
+        # Save model
+        model_file, scaler_file, imputer_file, feature_file = trainer.save_model()
+        
+        # Final summary
+        total_time = time.time() - start_time
+        print(f"\n🎯 TRAINING COMPLETE!")
+        print("=" * 60)
+        print(f"✅ Successfully trained neural network with incremental learning")
+        print(f"📊 Features used: {len(important_features)} + engineered features")
+        print(f"⏱️ Total training time: {total_time/60:.1f} minutes")
+        print(f"💾 Model saved: {model_file}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+if __name__ == "__main__":
+    main() 
