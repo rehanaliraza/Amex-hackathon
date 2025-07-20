@@ -1,0 +1,8 @@
+Full Dataset XGBoost Model
+========================================
+Training date: 2025-07-18 00:29:37
+Features used: 89
+Validation AUC: 0.8857
+Model file: best_model_full_xgboost_optimized.json
+Preprocessor file: data_preprocessor_full_xgboost.pkl
+Features file: features_full_xgboost.txt

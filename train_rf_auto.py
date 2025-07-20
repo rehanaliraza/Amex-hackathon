@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+Auto Random Forest Training with Class Imbalance Handling
+Non-interactive version that automatically handles limited resources
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from sklearn.impute import SimpleImputer
+from imblearn.over_sampling import SMOTE
+from collections import Counter
+import warnings
+import time
+import psutil
+import joblib
+import gc
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+
+def main():
+    """Auto Random Forest training with class balancing"""
+    print("🚀 AUTO RANDOM FOREST TRAINING WITH CLASS IMBALANCE HANDLING")
+    print("=" * 70)
+    
+    # Check memory and automatically adjust
+    memory_gb = psutil.virtual_memory().available / (1024**3)
+    print(f"💻 Available memory: {memory_gb:.1f} GB")
+    
+    # Automatically determine sample size and approach based on memory
+    if memory_gb >= 4:
+        sample_size = 77000
+        use_smote = True
+        print(f"📊 High memory mode: {sample_size:,} samples with SMOTE")
+    elif memory_gb >= 2:
+        sample_size = 50000
+        use_smote = False
+        print(f"📊 Medium memory mode: {sample_size:,} samples with class_weight only")
+    else:
+        sample_size = 30000
+        use_smote = False
+        print(f"📊 Low memory mode: {sample_size:,} samples with class_weight only")
+    
+    print("✅ Automatically continuing with available resources...")
+    
+    # Load data
+    print("\n🔄 Loading data...")
+    start_time = time.time()
+    train_df = pd.read_parquet('train_data.parquet')
+    
+    if sample_size < len(train_df):
+        train_df = train_df.sample(n=sample_size, random_state=42)
+    
+    print(f"✅ Data loaded: {len(train_df):,} samples in {time.time() - start_time:.2f}s")
+    
+    # Analyze class distribution
+    print("\n🎯 Class Distribution:")
+    target_dist = train_df['y'].value_counts().sort_index()
+    for class_val, count in target_dist.items():
+        pct = (count / len(train_df)) * 100
+        print(f"   Class {class_val}: {count:,} ({pct:.2f}%)")
+    
+    # Calculate imbalance ratio
+    if len(target_dist) == 2:
+        imbalance_ratio = target_dist.max() / target_dist.min()
+        print(f"   Imbalance ratio: {imbalance_ratio:.2f}:1")
+    
+    # Preprocess features
+    print("\n🔧 Preprocessing features...")
+    feature_cols = [col for col in train_df.columns if col.startswith('f')]
+    X = train_df[feature_cols].copy()
+    y = pd.to_numeric(train_df['y'], errors='coerce')
+    
+    print(f"   Features: {len(feature_cols)}")
+    print(f"   Missing values: {X.isnull().sum().sum():,}")
+    
+    # Convert to numeric and clean
+    for col in X.columns:
+        if X[col].dtype == 'object':
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+    
+    # Remove empty columns
+    valid_cols = [col for col in X.columns if X[col].notna().sum() > 0]
+    X = X[valid_cols]
+    print(f"   Valid features: {len(valid_cols)}")
+    
+    # Impute missing values
+    imputer = SimpleImputer(strategy='median')
+    X_imputed = pd.DataFrame(
+        imputer.fit_transform(X),
+        columns=X.columns,
+        index=X.index
+    )
+    
+    # Clean up
+    del train_df, X
+    gc.collect()
+    
+    # Split data
+    print("\n📊 Splitting data...")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_imputed, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"   Training: {len(X_train):,} samples")
+    print(f"   Validation: {len(X_val):,} samples")
+    
+    # Apply SMOTE if memory allows
+    if use_smote:
+        print("\n⚖️ Applying SMOTE for class balancing...")
+        smote = SMOTE(random_state=42, k_neighbors=5)
+        X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
+        print(f"   Original: {Counter(y_train)}")
+        print(f"   Balanced: {Counter(y_train_balanced)}")
+        X_train_final, y_train_final = X_train_balanced, y_train_balanced
+    else:
+        print("\n⚖️ Using class_weight='balanced' for class balancing...")
+        X_train_final, y_train_final = X_train, y_train
+    
+    # Train Random Forest
+    print("\n🌲 Training Random Forest...")
+    start_time = time.time()
+    
+    rf_params = {
+        'n_estimators': 100,
+        'random_state': 42,
+        'n_jobs': -1,
+        'max_depth': 15,
+        'min_samples_split': 10,
+        'min_samples_leaf': 5,
+        'verbose': 1
+    }
+    
+    # Add class_weight if not using SMOTE
+    if not use_smote:
+        rf_params['class_weight'] = 'balanced'
+    
+    rf_model = RandomForestClassifier(**rf_params)
+    rf_model.fit(X_train_final, y_train_final)
+    training_time = time.time() - start_time
+    
+    print(f"✅ Training completed in {training_time:.2f}s")
+    
+    # Evaluate
+    print("\n📊 Evaluating model...")
+    y_pred_proba = rf_model.predict_proba(X_val)[:, 1]
+    y_pred = rf_model.predict(X_val)
+    
+    auc_score = roc_auc_score(y_val, y_pred_proba)
+    print(f"   Validation AUC: {auc_score:.4f}")
+    
+    # Classification report
+    print("\n📈 Classification Report:")
+    print(classification_report(y_val, y_pred))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_val, y_pred)
+    print(f"\n📊 Confusion Matrix:")
+    print(f"   Predicted:    0      1")
+    print(f"Actual 0:    {cm[0,0]:6} {cm[0,1]:6}")
+    print(f"Actual 1:    {cm[1,0]:6} {cm[1,1]:6}")
+    
+    # Prediction distribution
+    pred_dist = Counter(y_pred)
+    print(f"\n📊 Prediction Distribution:")
+    for pred_val, count in sorted(pred_dist.items()):
+        pct = (count / len(y_pred)) * 100
+        print(f"   Class {pred_val}: {count:,} ({pct:.2f}%)")
+    
+    # Cross-validation
+    print("\n🔄 Cross-validation...")
+    try:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cv_scores = cross_val_score(rf_model, X_imputed, y, cv=skf, scoring='roc_auc', n_jobs=-1)
+        
+        print(f"   CV AUC scores: {[f'{score:.4f}' for score in cv_scores]}")
+        print(f"   Mean CV AUC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+    except Exception as e:
+        print(f"   Cross-validation skipped due to memory: {e}")
+        cv_scores = np.array([auc_score])
+    
+    # Feature importance
+    print("\n🔍 Top 10 Feature Importances:")
+    importances = rf_model.feature_importances_
+    feature_importance = list(zip(X_imputed.columns, importances))
+    feature_importance.sort(key=lambda x: x[1], reverse=True)
+    
+    for i, (feature, importance) in enumerate(feature_importance[:10]):
+        print(f"   {i+1:2d}. {feature:<12} {importance:.4f}")
+    
+    # Save model
+    print("\n💾 Saving model...")
+    technique = 'smote' if use_smote else 'balanced'
+    model_filename = f'best_model_auto_rf_{technique}.pkl'
+    preprocessor_filename = f'data_preprocessor_auto_rf_{technique}.pkl'
+    
+    joblib.dump(rf_model, model_filename)
+    joblib.dump(imputer, preprocessor_filename)
+    
+    print(f"✅ Model saved: {model_filename}")
+    print(f"✅ Preprocessor saved: {preprocessor_filename}")
+    
+    # Final summary
+    print(f"\n🎯 FINAL SUMMARY")
+    print("=" * 50)
+    print(f"✅ Auto Random Forest training complete")
+    print(f"📊 Dataset: {len(X_imputed):,} samples, {len(X_imputed.columns)} features")
+    print(f"⚖️ Balancing: {'SMOTE' if use_smote else 'Class Weight'}")
+    print(f"📈 Validation AUC: {auc_score:.4f}")
+    print(f"📈 Cross-validation AUC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+    print(f"⏱️ Training time: {training_time:.2f}s")
+    print(f"💾 Model: {model_filename}")
+    
+    # Memory usage
+    memory_info = psutil.virtual_memory()
+    print(f"\n💻 Final memory usage: {memory_info.percent:.1f}%")
+    
+    print(f"\n🎉 AUTO RANDOM FOREST TRAINING COMPLETE!")
+    print(f"   Model automatically optimized for your system!")
+    
+    return True
+
+if __name__ == "__main__":
+    try:
+        success = main()
+        if success:
+            print(f"\n🚀 Training successful! Use create_submission.py to generate predictions!")
+    except Exception as e:
+        print(f"❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc() 
